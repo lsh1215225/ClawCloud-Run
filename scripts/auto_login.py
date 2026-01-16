@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
 """
 ClawCloud 自动登录脚本
+- 自动检测区域跳转（如 ap-southeast-1.console.claw.cloud）
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
@@ -12,11 +12,13 @@ import time
 import base64
 import re
 import requests
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 # ==================== 配置 ====================
-CLAW_CLOUD_URL = "https://eu-central-1.run.claw.cloud"
-SIGNIN_URL = f"{CLAW_CLOUD_URL}/signin"
+# 固定登录入口，OAuth后会自动跳转到实际区域
+LOGIN_ENTRY_URL = "https://console.run.claw.cloud"
+SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
 DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
 
@@ -178,6 +180,10 @@ class AutoLogin:
         self.logs = []
         self.n = 0
         
+        # 区域相关
+        self.detected_region = None  # 检测到的区域，如 "ap-southeast-1"
+        self.region_base_url = None  # 检测到的区域基础 URL
+        
     def log(self, msg, level="INFO"):
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
         line = f"{icons.get(level, '•')} {msg}"
@@ -205,6 +211,54 @@ class AutoLogin:
             except:
                 pass
         return False
+    
+    def detect_region(self, url):
+        """
+        从 URL 中检测区域信息
+        例如: https://ap-southeast-1.console.claw.cloud/... -> ap-southeast-1
+        """
+        try:
+            parsed = urlparse(url)
+            host = parsed.netloc  # 如 "ap-southeast-1.console.claw.cloud"
+            
+            # 检查是否是区域子域名格式
+            # 格式: {region}.console.claw.cloud
+            if host.endswith('.console.claw.cloud'):
+                region = host.replace('.console.claw.cloud', '')
+                if region and region != 'console':  # 排除无效情况
+                    self.detected_region = region
+                    self.region_base_url = f"https://{host}"
+                    self.log(f"检测到区域: {region}", "SUCCESS")
+                    self.log(f"区域 URL: {self.region_base_url}", "INFO")
+                    return region
+            
+            # 如果是主域名 console.run.claw.cloud，可能还没跳转
+            if 'console.run.claw.cloud' in host or 'claw.cloud' in host:
+                # 尝试从路径或其他地方提取区域信息
+                # 有些平台可能在路径中包含区域，如 /region/ap-southeast-1/...
+                path = parsed.path
+                region_match = re.search(r'/(?:region|r)/([a-z]+-[a-z]+-\d+)', path)
+                if region_match:
+                    region = region_match.group(1)
+                    self.detected_region = region
+                    self.region_base_url = f"https://{region}.console.claw.cloud"
+                    self.log(f"从路径检测到区域: {region}", "SUCCESS")
+                    return region
+            
+            self.log(f"未检测到特定区域，使用当前域名: {host}", "INFO")
+            # 如果没有检测到区域，使用当前 URL 的基础部分
+            self.region_base_url = f"{parsed.scheme}://{parsed.netloc}"
+            return None
+            
+        except Exception as e:
+            self.log(f"区域检测异常: {e}", "WARN")
+            return None
+    
+    def get_base_url(self):
+        """获取当前应该使用的基础 URL"""
+        if self.region_base_url:
+            return self.region_base_url
+        return LOGIN_ENTRY_URL
     
     def get_session(self, context):
         """提取 Session Cookie"""
@@ -513,42 +567,74 @@ class AutoLogin:
             page.wait_for_load_state('networkidle', timeout=30000)
     
     def wait_redirect(self, page, wait=60):
-        """等待重定向"""
+        """等待重定向并检测区域"""
         self.log("等待重定向...", "STEP")
         for i in range(wait):
             url = page.url
+            
+            # 检查是否已跳转到 claw.cloud
             if 'claw.cloud' in url and 'signin' not in url.lower():
                 self.log("重定向成功！", "SUCCESS")
+                
+                # 检测并记录区域
+                self.detect_region(url)
+                
                 return True
+            
             if 'github.com/login/oauth/authorize' in url:
                 self.oauth(page)
+            
             time.sleep(1)
             if i % 10 == 0:
                 self.log(f"  等待... ({i}秒)")
+        
         self.log("重定向超时", "ERROR")
         return False
     
     def keepalive(self, page):
-        """保活"""
+        """保活 - 使用检测到的区域 URL"""
         self.log("保活...", "STEP")
-        for url, name in [(f"{CLAW_CLOUD_URL}/", "控制台"), (f"{CLAW_CLOUD_URL}/apps", "应用")]:
+        
+        # 使用检测到的区域 URL，如果没有则使用默认
+        base_url = self.get_base_url()
+        self.log(f"使用区域 URL: {base_url}", "INFO")
+        
+        pages_to_visit = [
+            (f"{base_url}/", "控制台"),
+            (f"{base_url}/apps", "应用"),
+        ]
+        
+        # 如果检测到了区域，可以额外访问一些区域特定页面
+        if self.detected_region:
+            self.log(f"当前区域: {self.detected_region}", "INFO")
+        
+        for url, name in pages_to_visit:
             try:
                 page.goto(url, timeout=30000)
                 page.wait_for_load_state('networkidle', timeout=15000)
-                self.log(f"已访问: {name}", "SUCCESS")
+                self.log(f"已访问: {name} ({url})", "SUCCESS")
+                
+                # 再次检测区域（以防中途跳转）
+                current_url = page.url
+                if 'claw.cloud' in current_url:
+                    self.detect_region(current_url)
+                
                 time.sleep(2)
-            except:
-                pass
+            except Exception as e:
+                self.log(f"访问 {name} 失败: {e}", "WARN")
+        
         self.shot(page, "完成")
     
     def notify(self, ok, err=""):
         if not self.tg.ok:
             return
         
+        region_info = f"\n<b>区域:</b> {self.detected_region or '默认'}" if self.detected_region else ""
+        
         msg = f"""<b>🤖 ClawCloud 自动登录</b>
 
 <b>状态:</b> {"✅ 成功" if ok else "❌ 失败"}
-<b>用户:</b> {self.username}
+<b>用户:</b> {self.username}{region_info}
 <b>时间:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}"""
         
         if err:
@@ -573,6 +659,7 @@ class AutoLogin:
         self.log(f"用户名: {self.username}")
         self.log(f"Session: {'有' if self.gh_session else '无'}")
         self.log(f"密码: {'有' if self.password else '无'}")
+        self.log(f"登录入口: {LOGIN_ENTRY_URL}")
         
         if not self.username or not self.password:
             self.log("缺少凭据", "ERROR")
@@ -599,15 +686,21 @@ class AutoLogin:
                     except:
                         self.log("加载 Cookie 失败", "WARN")
                 
-                # 1. 访问 ClawCloud
-                self.log("步骤1: 打开 ClawCloud", "STEP")
+                # 1. 访问 ClawCloud 登录入口
+                self.log("步骤1: 打开 ClawCloud 登录页", "STEP")
                 page.goto(SIGNIN_URL, timeout=60000)
                 page.wait_for_load_state('networkidle', timeout=30000)
                 time.sleep(2)
                 self.shot(page, "clawcloud")
                 
-                if 'signin' not in page.url.lower():
+                # 检查当前 URL，可能已经自动跳转到区域
+                current_url = page.url
+                self.log(f"当前 URL: {current_url}")
+                
+                if 'signin' not in current_url.lower() and 'claw.cloud' in current_url:
                     self.log("已登录！", "SUCCESS")
+                    # 检测区域
+                    self.detect_region(current_url)
                     self.keepalive(page)
                     # 提取并保存新 Cookie
                     new = self.get_session(context)
@@ -647,7 +740,7 @@ class AutoLogin:
                     self.log("Cookie 有效", "SUCCESS")
                     self.oauth(page)
                 
-                # 4. 等待重定向
+                # 4. 等待重定向（会自动检测区域）
                 self.log("步骤4: 等待重定向", "STEP")
                 if not self.wait_redirect(page):
                     self.shot(page, "重定向失败")
@@ -658,11 +751,16 @@ class AutoLogin:
                 
                 # 5. 验证
                 self.log("步骤5: 验证", "STEP")
-                if 'claw.cloud' not in page.url or 'signin' in page.url.lower():
+                current_url = page.url
+                if 'claw.cloud' not in current_url or 'signin' in current_url.lower():
                     self.notify(False, "验证失败")
                     sys.exit(1)
                 
-                # 6. 保活
+                # 再次确认区域检测
+                if not self.detected_region:
+                    self.detect_region(current_url)
+                
+                # 6. 保活（使用检测到的区域 URL）
                 self.keepalive(page)
                 
                 # 7. 提取并保存新 Cookie
@@ -676,6 +774,8 @@ class AutoLogin:
                 self.notify(True)
                 print("\n" + "="*50)
                 print("✅ 成功！")
+                if self.detected_region:
+                    print(f"📍 区域: {self.detected_region}")
                 print("="*50 + "\n")
                 
             except Exception as e:
